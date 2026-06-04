@@ -446,4 +446,4 @@ class DatabaseExtractor:
 
     def extract_data_batch(self, db, table, cols, offset=0, limit=50):
         if len(cols) > self.col_count - 1:
-            cols = cols[:self.col_count-1
+            cols = cols[:self.col_count-1]
